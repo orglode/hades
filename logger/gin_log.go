@@ -24,6 +24,7 @@ func GinMiddleware() gin.HandlerFunc {
 
 		// 记录日志
 		latency := time.Since(start)
+		ctx := c.Request.Context()
 		fields := []zap.Field{
 			zap.Int("status", c.Writer.Status()),
 			zap.String("method", c.Request.Method),
@@ -33,15 +34,18 @@ func GinMiddleware() gin.HandlerFunc {
 			zap.String("user-agent", c.Request.UserAgent()),
 			zap.Duration("latency", latency),
 		}
+		if traceID := getTraceID(ctx); traceID != "" {
+			fields = append(fields, zap.String("traceID", traceID))
+		}
 
 		if len(c.Errors) > 0 {
 			for _, err := range c.Errors {
-				// Gin错误日志写入error_*.log
-				Error(err.Error(), fields...)
+				// Gin错误日志写入error_*.log和终端
+				Error(ctx, err.Error(), fields...)
 			}
 		} else {
-			// 正常请求日志写入access_*.log
-			globalLogger.accessLogger.Info("request processed", fields...)
+			// 正常请求日志写入access_*.log和终端
+			globalLogger.accessLogger.Ctx(ctx).Info("request processed", fields...)
 		}
 	}
 }

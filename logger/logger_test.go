@@ -1,20 +1,33 @@
 package logger
 
 import (
+	"fmt"
 	"go.uber.org/zap"
 	"testing"
 	"time"
 )
 
-func TestNewLogger(t *testing.T) {
-	log, err := NewLogger("", Info)
-	if err != nil {
-		t.Fatal(err)
+func TestLogger(t *testing.T) {
+	config := Config{
+		LogDir:       "./logs",
+		MaxAge:       30 * 24 * time.Hour,
+		RotationTime: 24 * time.Hour,
+		Level:        "debug",
+		JSONFormat:   true,
 	}
-	defer log.Sync()
-	// 2. 设置全局panic捕获
-	defer log.Recover()
-	log.Info("Hello World")
-	log.Info("这是一条测试日志", zap.String("启动时间", time.Now().Format(time.RFC3339)))
+	if err := InitLogger(config); err != nil {
+		panic(err)
+	}
+	defer Close()
+
+	// 测试日志级别
+	Debug("This is a debug message", zap.String("key", "debug"))
+	Info("This is an info message", zap.Int("count", 42))
+	Warn("This is a warn message", zap.String("context", "warning"))
+	Error("This is an error message", zap.Error(fmt.Errorf("something went wrong")))
+
+	// 测试自定义错误
+	customErr := NewCustomError("ERR001", "test error", map[string]interface{}{"retry": 3})
+	LogCustomError(customErr)
 
 }

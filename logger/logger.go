@@ -5,242 +5,370 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
-	"sync"
 	"time"
 
-	"github.com/lestrrat-go/file-rotatelogs"
+	"github.com/gin-gonic/gin"
+	rotatelogs "github.com/lestrrat-go/file-rotatelogs"
+	"github.com/uptrace/opentelemetry-go-extra/otelzap"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"gorm.io/gorm"
-	gormlogger "gorm.io/gorm/logger"
+	"gorm.io/gorm/logger"
 )
 
-// LogLevel 自定义日志级别
+// Logger 是日志实例
+type Logger struct {
+	config       Config
+	syncers      map[string]zapcore.WriteSyncer // 按日志类型存储的写入器
+	levelLoggers map[LogLevel]*otelzap.Logger   // 按日志级别存储的专用Logger
+	accessLogger *otelzap.Logger                // Gin访问日志Logger
+	sqlLogger    *otelzap.Logger                // GORM SQL日志Logger
+}
+
+// Config 日志配置
+type Config struct {
+	LogDir       string        // 日志目录
+	MaxAge       time.Duration // 日志最大保留时间
+	RotationTime time.Duration // 日志分割时间
+	Level        string        // 日志级别
+	JSONFormat   bool          // 是否使用JSON格式
+}
+
+// LogLevel 定义日志级别
 type LogLevel int
 
 const (
-	Silent LogLevel = iota
-	Error
-	Warn
-	Info
-	Debug
+	DebugLevel LogLevel = iota
+	InfoLevel
+	WarnLevel
+	ErrorLevel
+	FatalLevel
 )
 
-// Logger 核心日志结构
-type Logger struct {
-	zapLogger *zap.Logger
-	level     LogLevel
-	mu        sync.Mutex
+// CustomError 定义自定义错误结构
+type CustomError struct {
+	Code    string                 // 错误码
+	Message string                 // 错误消息
+	Fields  map[string]interface{} // 附加字段
 }
 
-// NewLogger 创建日志实例
-func NewLogger(logPath string, level LogLevel) (*Logger, error) {
-	if logPath == "" {
-		logPath = "./logs"
+// 全局日志器实例
+var globalLogger *Logger
+
+// NewCustomError 创建自定义错误
+func NewCustomError(code, message string, fields map[string]interface{}) *CustomError {
+	return &CustomError{
+		Code:    code,
+		Message: message,
+		Fields:  fields,
+	}
+}
+
+// InitLogger 初始化全局日志器
+func InitLogger(config Config) error {
+	// 设置默认值
+	if config.LogDir == "" {
+		config.LogDir = "./logs"
+	}
+	if config.MaxAge == 0 {
+		config.MaxAge = 30 * 24 * time.Hour
+	}
+	if config.RotationTime == 0 {
+		config.RotationTime = 24 * time.Hour
+	}
+	if config.Level == "" {
+		config.Level = "info"
 	}
 
-	// 1. 强制检查日志目录
-	if err := ensureLogDir(logPath); err != nil {
-		return nil, err
+	// 确保日志目录存在
+	if err := os.MkdirAll(config.LogDir, 0755); err != nil {
+		return fmt.Errorf("failed to create log directory: %w", err)
 	}
 
-	// 2. 配置 rotatelogs（关键修改：确保文件打开成功）
-	rl, err := rotatelogs.New(
-		filepath.Join(logPath, "app-%Y-%m-%d.log"),
-		rotatelogs.WithClock(rotatelogs.Local),
-		rotatelogs.WithMaxAge(30*24*time.Hour),
-		rotatelogs.WithRotationTime(24*time.Hour),
-		rotatelogs.WithLinkName(filepath.Join(logPath, "app_current.log")), // 明确软链接路径
+	// 设置全局日志级别
+	var zapLevel zapcore.Level
+	switch config.Level {
+	case "debug":
+		zapLevel = zap.DebugLevel
+	case "info":
+		zapLevel = zap.InfoLevel
+	case "warn":
+		zapLevel = zap.WarnLevel
+	case "error":
+		zapLevel = zap.ErrorLevel
+	case "fatal":
+		zapLevel = zap.FatalLevel
+	default:
+		zapLevel = zap.InfoLevel
+	}
+
+	// 配置编码器
+	encoderConfig := zap.NewProductionEncoderConfig()
+	encoderConfig.TimeKey = "timestamp"
+	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+
+	var encoder zapcore.Encoder
+	if config.JSONFormat {
+		encoder = zapcore.NewJSONEncoder(encoderConfig)
+	} else {
+		encoder = zapcore.NewConsoleEncoder(encoderConfig)
+	}
+
+	// 初始化不同类型的日志写入器和Logger
+	syncers := make(map[string]zapcore.WriteSyncer)
+	levelLoggers := make(map[LogLevel]*otelzap.Logger)
+
+	// 日志级别对应的文件名和Zap级别映射
+	levelFiles := map[LogLevel]struct {
+		fileName string
+		zapLevel zapcore.Level
+	}{
+		DebugLevel: {"debug_%Y%m%d.log", zapcore.DebugLevel},
+		InfoLevel:  {"info_%Y%m%d.log", zapcore.InfoLevel},
+		WarnLevel:  {"warn_%Y%m%d.log", zapcore.WarnLevel},
+		ErrorLevel: {"error_%Y%m%d.log", zapcore.ErrorLevel},
+		FatalLevel: {"fatal_%Y%m%d.log", zapcore.FatalLevel},
+	}
+
+	// 为每个日志级别创建rotatelogs写入器和专用Logger
+	for level, info := range levelFiles {
+		rotator, err := rotatelogs.New(
+			filepath.Join(config.LogDir, info.fileName),
+			rotatelogs.WithMaxAge(config.MaxAge),
+			rotatelogs.WithRotationTime(config.RotationTime),
+			rotatelogs.WithLinkName(filepath.Join(config.LogDir, info.fileName[:len(info.fileName)-len("_%Y%m%d.log")]+".log")),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to initialize rotatelogs for %s: %w", info.fileName, err)
+		}
+		syncer := zapcore.AddSync(rotator)
+		syncers[fmt.Sprintf("level_%d", level)] = syncer
+
+		// 创建仅允许特定级别的核心
+		levelEnabler := zap.LevelEnablerFunc(func(lvl zapcore.Level) bool {
+			return lvl == info.zapLevel && lvl >= zapLevel
+		})
+		core := zapcore.NewCore(encoder, syncer, levelEnabler)
+		zapLogger := zap.New(core, zap.AddCaller(), zap.AddStacktrace(zap.ErrorLevel))
+		levelLoggers[level] = otelzap.New(zapLogger)
+	}
+
+	// 创建Gin访问日志的rotatelogs写入器和Logger
+	accessRotator, err := rotatelogs.New(
+		filepath.Join(config.LogDir, "access_%Y%m%d.log"),
+		rotatelogs.WithMaxAge(config.MaxAge),
+		rotatelogs.WithRotationTime(config.RotationTime),
+		rotatelogs.WithLinkName(filepath.Join(config.LogDir, "access.log")),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("创建rotatelogs失败: %w", err)
+		return fmt.Errorf("failed to initialize rotatelogs for access: %w", err)
 	}
+	accessSyncer := zapcore.AddSync(accessRotator)
+	syncers["access"] = accessSyncer
+	accessCore := zapcore.NewCore(encoder, accessSyncer, zapLevel)
+	accessZapLogger := zap.New(accessCore, zap.AddCaller())
+	accessLogger := otelzap.New(accessZapLogger)
 
-	// 3. 立即测试文件写入
-	if _, err := rl.Write([]byte("=== INIT LOGGER ===\n")); err != nil {
-		return nil, fmt.Errorf("日志文件写入测试失败: %w", err)
-	}
-
-	// 4. 配置zap核心
-	encoderConfig := zapcore.EncoderConfig{
-		TimeKey:        "ts",
-		LevelKey:       "level",
-		NameKey:        "logger",
-		CallerKey:      "caller",
-		MessageKey:     "msg",
-		StacktraceKey:  "stacktrace",
-		LineEnding:     zapcore.DefaultLineEnding,
-		EncodeLevel:    zapcore.CapitalLevelEncoder,
-		EncodeTime:     zapcore.ISO8601TimeEncoder,
-		EncodeDuration: zapcore.StringDurationEncoder,
-		EncodeCaller:   zapcore.ShortCallerEncoder,
-	}
-
-	core := zapcore.NewCore(
-		zapcore.NewJSONEncoder(encoderConfig),
-		zapcore.NewMultiWriteSyncer(
-			zapcore.AddSync(rl),        // 主日志文件
-			zapcore.AddSync(os.Stdout), // 同时输出到控制台
-		),
-		zapcore.Level(level),
+	// 创建GORM SQL日志的rotatelogs写入器和Logger
+	sqlRotator, err := rotatelogs.New(
+		filepath.Join(config.LogDir, "sql_%Y%m%d.log"),
+		rotatelogs.WithMaxAge(config.MaxAge),
+		rotatelogs.WithRotationTime(config.RotationTime),
+		rotatelogs.WithLinkName(filepath.Join(config.LogDir, "sql.log")),
 	)
-
-	// 5. 构建Logger（添加文件写入确认钩子）
-	zapLogger := zap.New(core,
-		zap.AddCaller(),
-		zap.AddCallerSkip(1),
-		zap.AddStacktrace(zapcore.ErrorLevel),
-		zap.Hooks(func(entry zapcore.Entry) error {
-			// 每次写入后同步文件（生产环境建议异步处理）
-			_ = rl.Rotate()
-			return nil
-		}),
-	)
-
-	return &Logger{
-		zapLogger: zapLogger,
-		level:     level,
-	}, nil
-}
-
-// 实现日志级别方法
-func (l *Logger) Debug(msg string, fields ...zap.Field) {
-	l.zapLogger.Debug(msg, fields...)
-}
-
-func (l *Logger) Info(msg string, fields ...zap.Field) {
-	l.zapLogger.Info(msg, fields...)
-}
-
-func (l *Logger) Warn(msg string, fields ...zap.Field) {
-	l.zapLogger.Warn(msg, fields...)
-}
-
-func (l *Logger) Error(msg string, fields ...zap.Field) {
-	l.zapLogger.Error(msg, fields...)
-}
-
-func (l *Logger) Panic(msg string, fields ...zap.Field) {
-	l.zapLogger.Panic(msg, fields...)
-}
-
-// WithFields 添加结构化字段
-func (l *Logger) WithFields(fields ...zap.Field) *Logger {
-	return &Logger{
-		zapLogger: l.zapLogger.With(fields...),
-		level:     l.level,
+	if err != nil {
+		return fmt.Errorf("failed to initialize rotatelogs for sql: %w", err)
 	}
-}
+	sqlSyncer := zapcore.AddSync(sqlRotator)
+	syncers["sql"] = sqlSyncer
+	sqlCore := zapcore.NewCore(encoder, sqlSyncer, zapLevel)
+	sqlZapLogger := zap.New(sqlCore, zap.AddCaller())
+	sqlLogger := otelzap.New(sqlZapLogger)
 
-// Sync 刷新缓冲区的日志
-func (l *Logger) Sync() error {
-	return l.zapLogger.Sync()
-}
-
-// GormLogger GORM日志适配器
-type GormLogger struct {
-	Logger                  *Logger
-	SlowThreshold           time.Duration
-	SkipCallerLookup        bool
-	IgnoreRecordNotFoundErr bool
-}
-
-// NewGormLogger 创建GORM日志适配器
-func NewGormLogger(logger *Logger) *GormLogger {
-	return &GormLogger{
-		Logger:                  logger,
-		SlowThreshold:           200 * time.Millisecond,
-		SkipCallerLookup:        false,
-		IgnoreRecordNotFoundErr: true,
+	globalLogger = &Logger{
+		config:       config,
+		syncers:      syncers,
+		levelLoggers: levelLoggers,
+		accessLogger: accessLogger,
+		sqlLogger:    sqlLogger,
 	}
+	return nil
 }
 
-// LogMode 实现gorm logger.Interface接口
-func (l *GormLogger) LogMode(level gormlogger.LogLevel) gormlogger.Interface {
-	newLogger := *l
-	switch level {
-	case gormlogger.Silent:
-		newLogger.Logger.level = Silent
-	case gormlogger.Error:
-		newLogger.Logger.level = Error
-	case gormlogger.Warn:
-		newLogger.Logger.level = Warn
-	case gormlogger.Info:
-		newLogger.Logger.level = Info
-	}
-	return &newLogger
-}
-
-// Info 实现gorm logger.Interface接口
-func (l *GormLogger) Info(ctx context.Context, msg string, data ...interface{}) {
-	if l.Logger.level >= Info {
-		l.Logger.Info(fmt.Sprintf(msg, data...))
-	}
-}
-
-// Warn 实现gorm logger.Interface接口
-func (l *GormLogger) Warn(ctx context.Context, msg string, data ...interface{}) {
-	if l.Logger.level >= Warn {
-		l.Logger.Warn(fmt.Sprintf(msg, data...))
-	}
-}
-
-// Error 实现gorm logger.Interface接口
-func (l *GormLogger) Error(ctx context.Context, msg string, data ...interface{}) {
-	if l.Logger.level >= Error {
-		l.Logger.Error(fmt.Sprintf(msg, data...))
-	}
-}
-
-// Trace 实现gorm logger.Interface接口
-func (l *GormLogger) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
-	if l.Logger.level <= Silent {
+// Debug 记录Debug级别日志
+func Debug(msg string, fields ...zap.Field) {
+	if globalLogger == nil || globalLogger.levelLoggers[DebugLevel] == nil {
+		fmt.Fprintln(os.Stderr, "logger not initialized")
 		return
 	}
+	globalLogger.levelLoggers[DebugLevel].Debug(msg, fields...)
+}
 
+// Info 记录Info级别日志
+func Info(msg string, fields ...zap.Field) {
+	if globalLogger == nil || globalLogger.levelLoggers[InfoLevel] == nil {
+		fmt.Fprintln(os.Stderr, "logger not initialized")
+		return
+	}
+	globalLogger.levelLoggers[InfoLevel].Info(msg, fields...)
+}
+
+// Warn 记录Warn级别日志
+func Warn(msg string, fields ...zap.Field) {
+	if globalLogger == nil || globalLogger.levelLoggers[WarnLevel] == nil {
+		fmt.Fprintln(os.Stderr, "logger not initialized")
+		return
+	}
+	globalLogger.levelLoggers[WarnLevel].Warn(msg, fields...)
+}
+
+// Error 记录Error级别日志
+func Error(msg string, fields ...zap.Field) {
+	if globalLogger == nil || globalLogger.levelLoggers[ErrorLevel] == nil {
+		fmt.Fprintln(os.Stderr, "logger not initialized")
+		return
+	}
+	globalLogger.levelLoggers[ErrorLevel].Error(msg, fields...)
+}
+
+// Fatal 记录Fatal级别日志
+func Fatal(msg string, fields ...zap.Field) {
+	if globalLogger == nil || globalLogger.levelLoggers[FatalLevel] == nil {
+		fmt.Fprintln(os.Stderr, "logger not initialized")
+		os.Exit(1)
+	}
+	globalLogger.levelLoggers[FatalLevel].Fatal(msg, fields...)
+}
+
+// LogCustomError 记录自定义错误
+func LogCustomError(customErr *CustomError) {
+	if globalLogger == nil || globalLogger.levelLoggers[ErrorLevel] == nil {
+		fmt.Fprintln(os.Stderr, "logger not initialized")
+		return
+	}
+	fields := []zap.Field{
+		zap.String("error_code", customErr.Code),
+	}
+	for k, v := range customErr.Fields {
+		fields = append(fields, zap.Any(k, v))
+	}
+	globalLogger.levelLoggers[ErrorLevel].Error(customErr.Message, fields...)
+}
+
+// GinMiddleware 返回Gin的日志中间件
+func GinMiddleware() gin.HandlerFunc {
+	if globalLogger == nil || globalLogger.accessLogger == nil {
+		fmt.Fprintln(os.Stderr, "logger not initialized")
+		return func(c *gin.Context) { c.Next() }
+	}
+	return func(c *gin.Context) {
+		start := time.Now()
+		path := c.Request.URL.Path
+		query := c.Request.URL.RawQuery
+
+		// 处理请求
+		c.Next()
+
+		// 记录日志
+		latency := time.Since(start)
+		fields := []zap.Field{
+			zap.Int("status", c.Writer.Status()),
+			zap.String("method", c.Request.Method),
+			zap.String("path", path),
+			zap.String("query", query),
+			zap.String("ip", c.ClientIP()),
+			zap.String("user-agent", c.Request.UserAgent()),
+			zap.Duration("latency", latency),
+		}
+
+		if len(c.Errors) > 0 {
+			for _, err := range c.Errors {
+				// Gin错误日志写入error_*.log
+				Error(err.Error(), fields...)
+			}
+		} else {
+			// 正常请求日志写入access_*.log
+			globalLogger.accessLogger.Info("request processed", fields...)
+		}
+	}
+}
+
+// GormLogger 返回GORM的日志器
+func GormLogger() logger.Interface {
+	if globalLogger == nil || globalLogger.sqlLogger == nil {
+		fmt.Fprintln(os.Stderr, "logger not initialized")
+		return logger.Default
+	}
+	return &gormLogger{logger: globalLogger}
+}
+
+// gormLogger 实现GORM的logger.Interface
+type gormLogger struct {
+	logger *Logger
+}
+
+// LogMode 设置GORM日志模式
+func (g *gormLogger) LogMode(level logger.LogLevel) logger.Interface {
+	return g
+}
+
+// Info 记录GORM Info日志
+func (g *gormLogger) Info(ctx context.Context, msg string, data ...interface{}) {
+	// GORM Info日志写入sql_*.log
+	g.logger.sqlLogger.Ctx(ctx).Info(fmt.Sprintf(msg, data...))
+}
+
+// Warn 记录GORM Warn日志
+func (g *gormLogger) Warn(ctx context.Context, msg string, data ...interface{}) {
+	// GORM Warn日志写入sql_*.log
+	g.logger.sqlLogger.Ctx(ctx).Warn(fmt.Sprintf(msg, data...))
+}
+
+// Error 记录GORM Error日志
+func (g *gormLogger) Error(ctx context.Context, msg string, data ...interface{}) {
+	// GORM Error日志写入sql_*.log
+	g.logger.sqlLogger.Ctx(ctx).Error(fmt.Sprintf(msg, data...))
+}
+
+// Trace 记录GORM SQL执行日志
+func (g *gormLogger) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
 	elapsed := time.Since(begin)
 	sql, rows := fc()
-
 	fields := []zap.Field{
-		zap.String("sql", sql),
-		zap.Int64("rows", rows),
 		zap.Duration("elapsed", elapsed),
+		zap.Int64("rows", rows),
+		zap.String("sql", sql),
 	}
 
-	switch {
-	case err != nil && !(l.IgnoreRecordNotFoundErr && err == gorm.ErrRecordNotFound):
-		l.Logger.Error("gorm error", append(fields, zap.Error(err))...)
-	case elapsed > l.SlowThreshold && l.SlowThreshold != 0:
-		l.Logger.Warn(fmt.Sprintf("SLOW SQL >= %v", l.SlowThreshold), fields...)
-	case l.Logger.level == Debug:
-		l.Logger.Debug("gorm trace", fields...)
-	}
-}
-
-// Recover 捕获panic
-func (l *Logger) Recover() {
-	if err := recover(); err != nil {
-		stack := make([]byte, 4096)
-		length := runtime.Stack(stack, false)
-		l.Error("PANIC RECOVERED",
-			zap.Any("error", err),
-			zap.String("stack", string(stack[:length])),
-		)
+	if err != nil {
+		// SQL错误日志写入sql_*.log
+		g.logger.sqlLogger.Ctx(ctx).Error("sql execution error", append(fields, zap.Error(err))...)
+	} else {
+		// SQL调试日志写入sql_*.log
+		g.logger.sqlLogger.Ctx(ctx).Debug("sql executed", fields...)
 	}
 }
 
-func ensureLogDir(logPath string) error {
-	if err := os.MkdirAll(logPath, 0755); err != nil {
-		return fmt.Errorf("创建日志目录失败: %w", err)
+// Sync 同步日志缓冲区
+func Sync() error {
+	if globalLogger == nil {
+		return fmt.Errorf("logger not initialized")
 	}
-
-	// 验证目录是否可写
-	testFile := filepath.Join(logPath, ".testwrite")
-	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
-		return fmt.Errorf("日志目录不可写: %w", err)
+	var lastErr error
+	for level, l := range globalLogger.levelLoggers {
+		if err := l.Sync(); err != nil {
+			lastErr = fmt.Errorf("failed to sync level %d logger: %w", level, err)
+		}
 	}
-	_ = os.Remove(testFile) // 清理测试文件
+	if err := globalLogger.accessLogger.Sync(); err != nil {
+		lastErr = fmt.Errorf("failed to sync access logger: %w", err)
+	}
+	if err := globalLogger.sqlLogger.Sync(); err != nil {
+		lastErr = fmt.Errorf("failed to sync sql logger: %w", err)
+	}
+	return lastErr
+}
 
-	return nil
+// Close 关闭日志器
+func Close() error {
+	return Sync()
 }

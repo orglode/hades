@@ -3,6 +3,7 @@ package logger
 import (
 	"context"
 	"fmt"
+	"github.com/orglode/hades/trace"
 	"go.uber.org/zap"
 	"gorm.io/gorm/logger"
 	"os"
@@ -31,31 +32,31 @@ func (g *gormLogger) LogMode(level logger.LogLevel) logger.Interface {
 // Info 记录GORM Info日志
 func (g *gormLogger) Info(ctx context.Context, msg string, data ...interface{}) {
 	fields := []zap.Field{}
-	if traceID := getTraceID(ctx); traceID != "" {
+	if traceID := trace.GetTraceID(ctx); traceID != "" {
 		fields = append(fields, zap.String("traceID", traceID))
 	}
 	// GORM Info日志写入sql_*.log和终端
-	g.logger.sqlLogger.Ctx(ctx).Info(fmt.Sprintf(msg, data...), fields...)
+	g.logger.sqlLogger.Info(fmt.Sprintf(msg, data...), fields...)
 }
 
 // Warn 记录GORM Warn日志
 func (g *gormLogger) Warn(ctx context.Context, msg string, data ...interface{}) {
 	fields := []zap.Field{}
-	if traceID := getTraceID(ctx); traceID != "" {
+	if traceID := trace.GetTraceID(ctx); traceID != "" {
 		fields = append(fields, zap.String("traceID", traceID))
 	}
 	// GORM Warn日志写入sql_*.log和终端
-	g.logger.sqlLogger.Ctx(ctx).Warn(fmt.Sprintf(msg, data...), fields...)
+	g.logger.sqlLogger.Warn(fmt.Sprintf(msg, data...), fields...)
 }
 
 // Error 记录GORM Error日志
 func (g *gormLogger) Error(ctx context.Context, msg string, data ...interface{}) {
 	fields := []zap.Field{}
-	if traceID := getTraceID(ctx); traceID != "" {
+	if traceID := trace.GetTraceID(ctx); traceID != "" {
 		fields = append(fields, zap.String("traceID", traceID))
 	}
 	// GORM Error日志写入sql_*.log和终端
-	g.logger.sqlLogger.Ctx(ctx).Error(fmt.Sprintf(msg, data...), fields...)
+	g.logger.sqlLogger.Error(fmt.Sprintf(msg, data...), fields...)
 }
 
 // Trace 记录GORM SQL执行日志
@@ -67,15 +68,15 @@ func (g *gormLogger) Trace(ctx context.Context, begin time.Time, fc func() (stri
 		zap.Int64("rows", rows),
 		zap.String("sql", sql),
 	}
-	if traceID := getTraceID(ctx); traceID != "" {
+	if traceID := trace.GetTraceID(ctx); traceID != "" {
 		fields = append(fields, zap.String("traceID", traceID))
 	}
 
 	if err != nil {
 		// SQL错误日志写入sql_*.log和终端
-		g.logger.sqlLogger.Ctx(ctx).Error("sql execution error", append(fields, zap.Error(err))...)
+		g.logger.sqlLogger.Error("sql execution error", append(fields, zap.Error(err))...)
 	} else {
 		// SQL调试日志写入sql_*.log和终端
-		g.logger.sqlLogger.Ctx(ctx).Debug("sql executed", fields...)
+		g.logger.sqlLogger.Debug("sql executed", fields...)
 	}
 }

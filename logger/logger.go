@@ -8,8 +8,7 @@ import (
 	"time"
 
 	rotatelogs "github.com/lestrrat-go/file-rotatelogs"
-	"github.com/uptrace/opentelemetry-go-extra/otelzap"
-	"go.opentelemetry.io/otel/trace"
+	"github.com/orglode/hades/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -18,9 +17,9 @@ import (
 type Logger struct {
 	config       Config
 	syncers      map[string]zapcore.WriteSyncer // 按日志类型存储的写入器
-	levelLoggers map[LogLevel]*otelzap.Logger   // 按日志级别存储的专用Logger
-	accessLogger *otelzap.Logger                // Gin访问日志Logger
-	sqlLogger    *otelzap.Logger                // GORM SQL日志Logger
+	levelLoggers map[LogLevel]*zap.Logger       // 按日志级别存储的专用Logger
+	accessLogger *zap.Logger                    // Gin访问日志Logger
+	sqlLogger    *zap.Logger                    // GORM SQL日志Logger
 }
 
 // Config 日志配置
@@ -60,15 +59,6 @@ func NewCustomError(code, message string, fields map[string]interface{}) *Custom
 		Message: message,
 		Fields:  fields,
 	}
-}
-
-// getTraceID 从上下文中提取traceID
-func getTraceID(ctx context.Context) string {
-	span := trace.SpanFromContext(ctx)
-	if span.SpanContext().HasTraceID() {
-		return span.SpanContext().TraceID().String()
-	}
-	return ""
 }
 
 // InitLogger 初始化全局日志器
@@ -112,7 +102,10 @@ func InitLogger(config Config) error {
 	// 配置编码器
 	encoderConfig := zap.NewProductionEncoderConfig()
 	encoderConfig.TimeKey = "timestamp"
-	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	// 自定义时间格式，精确到秒，使用 2006-01-02 15:04:05
+	encoderConfig.EncodeTime = func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
+		enc.AppendString(t.UTC().Format("2006-01-02 15:04:05"))
+	}
 
 	var encoder zapcore.Encoder
 	if config.JSONFormat {
@@ -123,7 +116,7 @@ func InitLogger(config Config) error {
 
 	// 初始化不同类型的日志写入器和Logger
 	syncers := make(map[string]zapcore.WriteSyncer)
-	levelLoggers := make(map[LogLevel]*otelzap.Logger)
+	levelLoggers := make(map[LogLevel]*zap.Logger)
 
 	// 日志级别对应的文件名和Zap级别映射
 	levelFiles := map[LogLevel]struct {
@@ -158,7 +151,7 @@ func InitLogger(config Config) error {
 		})
 		core := zapcore.NewCore(encoder, syncer, levelEnabler)
 		zapLogger := zap.New(core, zap.AddCaller(), zap.AddStacktrace(zap.ErrorLevel))
-		levelLoggers[level] = otelzap.New(zapLogger)
+		levelLoggers[level] = zapLogger
 	}
 
 	// 创建Gin访问日志的rotatelogs写入器和Logger
@@ -175,8 +168,7 @@ func InitLogger(config Config) error {
 	accessSyncer := zapcore.NewMultiWriteSyncer(zapcore.AddSync(accessRotator), zapcore.AddSync(os.Stdout))
 	syncers["access"] = accessSyncer
 	accessCore := zapcore.NewCore(encoder, accessSyncer, zapLevel)
-	accessZapLogger := zap.New(accessCore, zap.AddCaller())
-	accessLogger := otelzap.New(accessZapLogger)
+	accessLogger := zap.New(accessCore, zap.AddCaller())
 
 	// 创建GORM SQL日志的rotatelogs写入器和Logger
 	sqlRotator, err := rotatelogs.New(
@@ -192,8 +184,7 @@ func InitLogger(config Config) error {
 	sqlSyncer := zapcore.NewMultiWriteSyncer(zapcore.AddSync(sqlRotator), zapcore.AddSync(os.Stdout))
 	syncers["sql"] = sqlSyncer
 	sqlCore := zapcore.NewCore(encoder, sqlSyncer, zapLevel)
-	sqlZapLogger := zap.New(sqlCore, zap.AddCaller())
-	sqlLogger := otelzap.New(sqlZapLogger)
+	sqlLogger := zap.New(sqlCore, zap.AddCaller())
 
 	globalLogger = &Logger{
 		config:       config,
@@ -205,68 +196,68 @@ func InitLogger(config Config) error {
 	return nil
 }
 
-// DebugWithContext 记录Debug级别日志，带上下文
+// Debug 记录Debug级别日志，带上下文
 func Debug(ctx context.Context, msg string, fields ...zap.Field) {
 	if globalLogger == nil || globalLogger.levelLoggers[DebugLevel] == nil {
 		fmt.Fprintln(os.Stderr, "logger not initialized")
 		return
 	}
-	if traceID := getTraceID(ctx); traceID != "" {
+	if traceID := trace.GetTraceID(ctx); traceID != "" {
 		fields = append(fields, zap.String("traceID", traceID))
 	}
-	globalLogger.levelLoggers[DebugLevel].Ctx(ctx).Debug(msg, fields...)
+	globalLogger.levelLoggers[DebugLevel].Debug(msg, fields...)
 }
 
-// InfoWithContext 记录Info级别日志，带上下文
+// Info 记录Info级别日志，带上下文
 func Info(ctx context.Context, msg string, fields ...zap.Field) {
 	if globalLogger == nil || globalLogger.levelLoggers[InfoLevel] == nil {
 		fmt.Fprintln(os.Stderr, "logger not initialized")
 		return
 	}
-	if traceID := getTraceID(ctx); traceID != "" {
+	if traceID := trace.GetTraceID(ctx); traceID != "" {
 		fields = append(fields, zap.String("traceID", traceID))
 	}
-	globalLogger.levelLoggers[InfoLevel].Ctx(ctx).Info(msg, fields...)
+	globalLogger.levelLoggers[InfoLevel].Info(msg, fields...)
 }
 
-// WarnWithContext 记录Warn级别日志，带上下文
+// Warn 记录Warn级别日志，带上下文
 func Warn(ctx context.Context, msg string, fields ...zap.Field) {
 	if globalLogger == nil || globalLogger.levelLoggers[WarnLevel] == nil {
 		fmt.Fprintln(os.Stderr, "logger not initialized")
 		return
 	}
-	if traceID := getTraceID(ctx); traceID != "" {
+	if traceID := trace.GetTraceID(ctx); traceID != "" {
 		fields = append(fields, zap.String("traceID", traceID))
 	}
-	globalLogger.levelLoggers[WarnLevel].Ctx(ctx).Warn(msg, fields...)
+	globalLogger.levelLoggers[WarnLevel].Warn(msg, fields...)
 }
 
-// ErrorWithContext 记录Error级别日志，带上下文
+// Error 记录Error级别日志，带上下文
 func Error(ctx context.Context, msg string, fields ...zap.Field) {
 	if globalLogger == nil || globalLogger.levelLoggers[ErrorLevel] == nil {
 		fmt.Fprintln(os.Stderr, "logger not initialized")
 		return
 	}
-	if traceID := getTraceID(ctx); traceID != "" {
+	if traceID := trace.GetTraceID(ctx); traceID != "" {
 		fields = append(fields, zap.String("traceID", traceID))
 	}
-	globalLogger.levelLoggers[ErrorLevel].Ctx(ctx).Error(msg, fields...)
+	globalLogger.levelLoggers[ErrorLevel].Error(msg, fields...)
 }
 
-// FatalWithContext 记录Fatal级别日志，带上下文
+// Fatal 记录Fatal级别日志，带上下文
 func Fatal(ctx context.Context, msg string, fields ...zap.Field) {
 	if globalLogger == nil || globalLogger.levelLoggers[FatalLevel] == nil {
 		fmt.Fprintln(os.Stderr, "logger not initialized")
 		os.Exit(1)
 	}
-	if traceID := getTraceID(ctx); traceID != "" {
+	if traceID := trace.GetTraceID(ctx); traceID != "" {
 		fields = append(fields, zap.String("traceID", traceID))
 	}
-	globalLogger.levelLoggers[FatalLevel].Ctx(ctx).Fatal(msg, fields...)
+	globalLogger.levelLoggers[FatalLevel].Fatal(msg, fields...)
 }
 
-// LogCustomErrorWithContext 记录自定义错误，带上下文
-func LogCustomErrorWithContext(ctx context.Context, customErr *CustomError) {
+// LogCustomError 记录自定义错误，带上下文
+func LogCustomError(ctx context.Context, customErr *CustomError) {
 	if globalLogger == nil || globalLogger.levelLoggers[ErrorLevel] == nil {
 		fmt.Fprintln(os.Stderr, "logger not initialized")
 		return
@@ -274,17 +265,13 @@ func LogCustomErrorWithContext(ctx context.Context, customErr *CustomError) {
 	fields := []zap.Field{
 		zap.String("error_code", customErr.Code),
 	}
-	if traceID := getTraceID(ctx); traceID != "" {
+	if traceID := trace.GetTraceID(ctx); traceID != "" {
 		fields = append(fields, zap.String("traceID", traceID))
 	}
 	for k, v := range customErr.Fields {
 		fields = append(fields, zap.Any(k, v))
 	}
-	globalLogger.levelLoggers[ErrorLevel].Ctx(ctx).Error(customErr.Message, fields...)
-}
-
-func LogCustomError(customErr *CustomError) {
-	LogCustomErrorWithContext(context.Background(), customErr)
+	globalLogger.levelLoggers[ErrorLevel].Error(customErr.Message, fields...)
 }
 
 // Sync 同步日志缓冲区

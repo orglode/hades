@@ -3,6 +3,7 @@ package logger
 import (
 	"fmt"
 	"github.com/gin-gonic/gin"
+	"github.com/orglode/hades/trace"
 	"go.uber.org/zap"
 	"os"
 	"time"
@@ -34,7 +35,7 @@ func GinMiddleware() gin.HandlerFunc {
 			zap.String("user-agent", c.Request.UserAgent()),
 			zap.Duration("latency", latency),
 		}
-		if traceID := getTraceID(ctx); traceID != "" {
+		if traceID := trace.GetTraceID(ctx); traceID != "" {
 			fields = append(fields, zap.String("traceID", traceID))
 		}
 
@@ -45,7 +46,7 @@ func GinMiddleware() gin.HandlerFunc {
 			}
 		} else {
 			// 正常请求日志写入access_*.log和终端
-			globalLogger.accessLogger.Ctx(ctx).Info("request processed", fields...)
+			globalLogger.accessLogger.Info("request processed", fields...)
 		}
 	}
 }

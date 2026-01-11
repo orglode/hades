@@ -1,52 +1,106 @@
 package logger
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/orglode/hades/trace"
-	"go.uber.org/zap"
-	"os"
+	"io/ioutil"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
-// GinMiddleware 返回Gin的日志中间件
-func GinMiddleware() gin.HandlerFunc {
-	if globalLogger == nil || globalLogger.accessLogger == nil {
-		fmt.Fprintln(os.Stderr, "logger not initialized")
-		return func(c *gin.Context) { c.Next() }
-	}
+// GinLogger 返回Gin日志中间件
+func GinLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		path := c.Request.URL.Path
 		query := c.Request.URL.RawQuery
 
+		// 读取请求体
+		var requestBody interface{}
+		if c.Request.Body != nil && c.Request.ContentLength > 0 {
+			bodyBytes, err := ioutil.ReadAll(c.Request.Body)
+			if err == nil && len(bodyBytes) > 0 {
+				// 尝试解析为JSON
+				var bodyMap map[string]interface{}
+				if json.Unmarshal(bodyBytes, &bodyMap) == nil {
+					requestBody = bodyMap
+				} else {
+					// 如果不是JSON，则保存为字符串
+					requestBody = string(bodyBytes)
+				}
+				// 重新设置请求体
+				c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+			}
+		}
+
 		// 处理请求
 		c.Next()
 
-		// 记录日志
-		latency := time.Since(start)
-		ctx := c.Request.Context()
-		fields := []zap.Field{
-			zap.Int("status", c.Writer.Status()),
-			zap.String("method", c.Request.Method),
-			zap.String("path", path),
-			zap.String("query", query),
-			zap.String("ip", c.ClientIP()),
-			zap.String("user-agent", c.Request.UserAgent()),
-			zap.Duration("latency", latency),
-		}
-		if traceID := trace.GetTraceID(ctx); traceID != "" {
-			fields = append(fields, zap.String("traceID", traceID))
+		end := time.Now()
+		latency := end.Sub(start)
+
+		// 收集请求头
+		headers := make(map[string]string)
+		importantHeaders := []string{
+			"Content-Type", "Authorization", "User-Agent",
+			"X-Request-ID", "X-Forwarded-For", "Referer",
 		}
 
-		if len(c.Errors) > 0 {
-			for _, err := range c.Errors {
-				// Gin错误日志写入error_*.log和终端
-				Error(ctx, err.Error(), fields...)
+		for _, headerName := range importantHeaders {
+			if val := c.GetHeader(headerName); val != "" {
+				headers[headerName] = val
+			}
+		}
+
+		// 获取traceID
+		var traceID string
+		if val, exists := c.Get("trace_id"); exists {
+			if tid, ok := val.(string); ok {
+				traceID = tid
+			}
+		}
+		// 创建请求信息
+		reqInfo := GinRequestInfo{
+			Method:       c.Request.Method,
+			Path:         path,
+			Query:        query,
+			Status:       c.Writer.Status(),
+			IP:           c.ClientIP(),
+			UserAgent:    c.Request.UserAgent(),
+			Latency:      latency.String(),
+			RequestBody:  requestBody,
+			Headers:      headers,
+			ResponseSize: c.Writer.Size(),
+			Timestamp:    end.Format("2006-01-02 15:04:05"),
+			TraceID:      traceID,
+		}
+
+		// 根据状态码选择日志级别
+		status := c.Writer.Status()
+		logFields := []zap.Field{
+			zap.Any("request", reqInfo),
+			zap.String("caller", getSimplifiedCaller(2)),
+		}
+
+		// 记录日志
+		if globalLogger != nil && globalLogger.accessLogger != nil {
+			switch {
+			case status >= 500:
+				globalLogger.accessLogger.Error("Server Error", logFields...)
+			case status >= 400:
+				globalLogger.accessLogger.Warn("Client Error", logFields...)
+			default:
+				globalLogger.accessLogger.Info("Request", logFields...)
 			}
 		} else {
-			// 正常请求日志写入access_*.log和终端
-			globalLogger.accessLogger.Info("request processed", fields...)
+			// 如果日志器未初始化，输出到控制台
+			logStr, _ := json.Marshal(reqInfo)
+			fmt.Printf("[GIN] %s %s %d %s - %s\n",
+				reqInfo.Method, reqInfo.Path, reqInfo.Status,
+				reqInfo.Latency, string(logStr))
 		}
 	}
 }

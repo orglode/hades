@@ -1,4 +1,4 @@
-package logger
+package logger_v2
 
 import (
 	"bytes"

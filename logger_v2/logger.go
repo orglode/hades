@@ -168,7 +168,7 @@ func (s *simplifiedStackEncoder) EncodeEntry(entry zapcore.Entry, fields []zap.F
 	return s.Encoder.EncodeEntry(entry, fields)
 }
 
-// simplifyStackTrace 简化堆栈跟踪信息
+// simplifyStackTrace 简化堆栈跟踪信息，只提取出问题的文件和函数
 func simplifyStackTrace(stack string, skip int) string {
 	if stack == "" {
 		return ""
@@ -176,14 +176,10 @@ func simplifyStackTrace(stack string, skip int) string {
 
 	lines := strings.Split(stack, "\n")
 	if len(lines) <= 1 {
-		return stack
+		return ""
 	}
 
-	var simplified []string
-	stackDepth := 0
-	maxDepth := 3 // 最多显示3层栈
-
-	// 跳过第一个goroutine行
+	// 查找第一个有效的栈帧行
 	for i := 1; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
@@ -196,49 +192,48 @@ func simplifyStackTrace(stack string, skip int) string {
 			if strings.Contains(line, "/vendor/") ||
 				strings.Contains(line, "go.uber.org/zap") ||
 				strings.Contains(line, "runtime.") ||
-				strings.Contains(line, "github.com/orglode/") {
+				strings.Contains(line, "reflect.") ||
+				strings.Contains(line, "testing.") {
 				continue
 			}
 
-			// 提取文件名和行号
+			// 提取完整路径和函数名
 			parts := strings.Split(line, " ")
 			if len(parts) >= 2 {
-				// 格式如: /path/to/file.go:123
-				filePath := parts[len(parts)-1]
-				// 只取文件名
-				_, file := filepath.Split(filePath)
-				if file != "" {
-					// 提取函数名
-					funcName := ""
-					if len(parts) > 1 {
-						// 格式如: github.com/user/repo/package.function
-						fullFunc := parts[0]
-						if idx := strings.LastIndex(fullFunc, "/"); idx != -1 {
-							funcName = fullFunc[idx+1:]
-							if dotIdx := strings.Index(funcName, "."); dotIdx != -1 {
-								funcName = funcName[dotIdx+1:]
-							}
-						}
+				// parts[0] 是完整的函数路径，如: github.com/user/project/path/file.function
+				// parts[len(parts)-1] 是文件和行号，如: /full/path/to/file.go:123
+
+				// 提取函数名
+				funcName := ""
+				fullFunc := parts[0]
+				if idx := strings.LastIndex(fullFunc, "."); idx != -1 {
+					funcName = fullFunc[idx+1:] // 获取函数名
+
+					// 获取文件路径（去掉包名部分）
+					filePath := fullFunc[:idx]
+					if pkgIdx := strings.LastIndex(filePath, "/"); pkgIdx != -1 {
+						filePath = filePath[pkgIdx+1:]
 					}
 
-					if funcName != "" {
-						simplified = append(simplified, fmt.Sprintf("%s(%s)", funcName, file))
-					} else {
-						simplified = append(simplified, file)
+					// 提取文件和行号
+					fileAndLine := parts[len(parts)-1]
+					if idx := strings.LastIndex(fileAndLine, "/"); idx != -1 {
+						fileName := fileAndLine[idx+1:] // 获取文件名
+						return fmt.Sprintf("%s.%s:%s", filePath, funcName, fileName)
 					}
-					stackDepth++
-					if stackDepth >= maxDepth {
-						break
-					}
+				}
+
+				// 如果上面的解析失败，回退到简单格式
+				fileAndLine := parts[len(parts)-1]
+				if idx := strings.LastIndex(fileAndLine, "/"); idx != -1 {
+					fileName := fileAndLine[idx+1:] // 获取文件名
+					return fmt.Sprintf("%s:%s", funcName, fileName)
 				}
 			}
 		}
 	}
 
-	if len(simplified) == 0 {
-		return "stacktrace: [simplified]"
-	}
-	return "stacktrace: " + strings.Join(simplified, " > ")
+	return ""
 }
 
 // 创建带简化stacktrace的编码器

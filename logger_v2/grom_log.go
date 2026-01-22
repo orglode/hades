@@ -2,10 +2,12 @@ package logger_v2
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/orglode/hades/trace"
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
 
@@ -73,8 +75,10 @@ func (g *GormLoggerAdapter) Trace(ctx context.Context, begin time.Time, fc func(
 	fields = append(fields, zap.String("caller", getSimplifiedCaller(4)))
 
 	if err != nil && g.LogLevel >= logger.Error {
-		fields = append(fields, zap.Error(err))
-		g.Logger.Error("SQL执行错误", fields...)
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			fields = append(fields, zap.Error(err))
+			g.Logger.Error("SQL执行错误", fields...)
+		}
 	} else if elapsed > 200*time.Millisecond && g.LogLevel >= logger.Warn {
 		fields = append(fields, zap.Duration("slow_threshold", 200*time.Millisecond))
 		g.Logger.Warn("SQL慢查询", fields...)

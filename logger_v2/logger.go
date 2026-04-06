@@ -248,7 +248,9 @@ func createEncoderWithSimpleStack(jsonFormat bool, callerSkip int) zapcore.Encod
 		encoderConfig.CallerKey = "caller"
 		encoderConfig.StacktraceKey = "stacktrace"
 		encoderConfig.EncodeTime = func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
-			enc.AppendString(t.UTC().Format("2006-01-02 15:04:05"))
+			// 设置为东八区北京时间
+			tz, _ := time.LoadLocation("Asia/Shanghai")
+			enc.AppendString(t.In(tz).Format("2006-01-02 15:04:05"))
 		}
 		encoderConfig.EncodeCaller = simpleCallerEncoder
 		encoderConfig.EncodeLevel = zapcore.LowercaseLevelEncoder
@@ -266,7 +268,9 @@ func createEncoderWithSimpleStack(jsonFormat bool, callerSkip int) zapcore.Encod
 			LineEnding:    zapcore.DefaultLineEnding,
 			EncodeLevel:   zapcore.CapitalColorLevelEncoder,
 			EncodeTime: func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
-				enc.AppendString(t.Format("15:04:05"))
+				// 设置为东八区北京时间
+				tz, _ := time.LoadLocation("Asia/Shanghai")
+				enc.AppendString(t.In(tz).Format("15:04:05"))
 			},
 			EncodeDuration: zapcore.StringDurationEncoder,
 			EncodeCaller:   simpleCallerEncoder,

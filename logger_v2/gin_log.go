@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,7 +21,7 @@ func GinLogger() gin.HandlerFunc {
 		// 读取请求体
 		var requestBody interface{}
 		if c.Request.Body != nil && c.Request.ContentLength > 0 {
-			bodyBytes, err := ioutil.ReadAll(c.Request.Body)
+			bodyBytes, err := io.ReadAll(c.Request.Body)
 			if err == nil && len(bodyBytes) > 0 {
 				// 尝试解析为JSON
 				var bodyMap map[string]interface{}
@@ -32,7 +32,7 @@ func GinLogger() gin.HandlerFunc {
 					requestBody = string(bodyBytes)
 				}
 				// 重新设置请求体
-				c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+				c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 			}
 		}
 
@@ -41,6 +41,8 @@ func GinLogger() gin.HandlerFunc {
 
 		end := time.Now()
 		latency := end.Sub(start)
+		// 设置为东八区北京时间
+		tz, _ := time.LoadLocation("Asia/Shanghai")
 
 		// 收集请求头
 		headers := make(map[string]string)
@@ -74,7 +76,7 @@ func GinLogger() gin.HandlerFunc {
 			RequestBody:  requestBody,
 			Headers:      headers,
 			ResponseSize: c.Writer.Size(),
-			Timestamp:    end.Format("2006-01-02 15:04:05"),
+			Timestamp:    end.In(tz).Format("2006-01-02 15:04:05"),
 			TraceID:      traceID,
 		}
 
